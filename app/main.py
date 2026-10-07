@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv()
 
-app = FastAPI(title="Image Translation API", version="3.0.0")
+app = FastAPI(title="Image Translation API", version="3.1.0")
 
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "")
@@ -35,35 +35,63 @@ def normalize_image(image_bytes: bytes) -> bytes:
         return output.getvalue()
 
 
+def box_to_pixels(box, width, height):
+    left = max(0, int(box.get("Left", 0) * width))
+    top = max(0, int(box.get("Top", 0) * height))
+    right = min(width, int((box.get("Left", 0) + box.get("Width", 0)) * width))
+    bottom = min(height, int((box.get("Top", 0) + box.get("Height", 0)) * height))
+    return [left, top, right, bottom]
+
+
 def extract_text_regions(image_bytes: bytes):
+    """Extract LINE text plus WORD boxes for precise background removal."""
     png_bytes = normalize_image(image_bytes)
     response = textract.detect_document_text(Document={"Bytes": png_bytes})
 
     with Image.open(io.BytesIO(png_bytes)) as img:
         width, height = img.size
 
+    blocks = response.get("Blocks", [])
+    words_by_id = {
+        block.get("Id"): block
+        for block in blocks
+        if block.get("BlockType") == "WORD"
+    }
+
     regions = []
-    for block in response.get("Blocks", []):
+
+    for block in blocks:
         if block.get("BlockType") != "LINE":
             continue
 
         text = block.get("Text", "").strip()
-        box = block.get("Geometry", {}).get("BoundingBox", {})
-
-        if not text or not box:
+        if not text:
             continue
 
-        left = max(0, int(box.get("Left", 0) * width))
-        top = max(0, int(box.get("Top", 0) * height))
-        right = min(width, int((box.get("Left", 0) + box.get("Width", 0)) * width))
-        bottom = min(height, int((box.get("Top", 0) + box.get("Height", 0)) * height))
+        line_box = block.get("Geometry", {}).get("BoundingBox", {})
+        if not line_box:
+            continue
 
-        if right > left and bottom > top:
-            regions.append({
-                "id": len(regions),
-                "source_text": text,
-                "bbox": [left, top, right, bottom],
-            })
+        word_boxes = []
+        for relationship in block.get("Relationships", []):
+            if relationship.get("Type") != "CHILD":
+                continue
+
+            for word_id in relationship.get("Ids", []):
+                word = words_by_id.get(word_id)
+                if not word:
+                    continue
+
+                word_box = word.get("Geometry", {}).get("BoundingBox")
+                if word_box:
+                    word_boxes.append(box_to_pixels(word_box, width, height))
+
+        regions.append({
+            "id": len(regions),
+            "source_text": text,
+            "bbox": box_to_pixels(line_box, width, height),
+            "mask_boxes": word_boxes or [box_to_pixels(line_box, width, height)],
+        })
 
     return regions
 
@@ -129,14 +157,58 @@ OCR lines:
     ]
 
 
+def estimate_text_color(rgb_image, bbox):
+    """Estimate original foreground color from contrast against local background."""
+    x1, y1, x2, y2 = bbox
+    height, width = rgb_image.shape[:2]
+
+    x1 = max(0, min(width - 1, x1))
+    y1 = max(0, min(height - 1, y1))
+    x2 = max(x1 + 1, min(width, x2))
+    y2 = max(y1 + 1, min(height, y2))
+
+    crop = rgb_image[y1:y2, x1:x2]
+    if crop.size == 0:
+        return (0, 0, 0)
+
+    # Sample a border around the text box as the local background.
+    pad = max(3, int((y2 - y1) * 0.7))
+    bx1 = max(0, x1 - pad)
+    by1 = max(0, y1 - pad)
+    bx2 = min(width, x2 + pad)
+    by2 = min(height, y2 + pad)
+
+    surrounding = rgb_image[by1:by2, bx1:bx2]
+    gray_crop = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    gray_surrounding = cv2.cvtColor(surrounding, cv2.COLOR_RGB2GRAY)
+
+    background_luma = float(np.median(gray_surrounding))
+    inside_luma = gray_crop.reshape(-1)
+
+    # Text is usually the pixels farthest from the local background.
+    distance = np.abs(inside_luma.astype(np.float32) - background_luma)
+    threshold = max(20.0, float(np.percentile(distance, 75)))
+    candidate_mask = distance >= threshold
+
+    pixels = crop.reshape(-1, 3)[candidate_mask]
+
+    if len(pixels) < 5:
+        return (255, 255, 255) if background_luma < 128 else (0, 0, 0)
+
+    color = np.median(pixels, axis=0).astype(int)
+    return tuple(int(v) for v in color)
+
+
 def get_font(size: int):
     candidates = []
+
     if FONT_PATH:
         candidates.append(FONT_PATH)
 
     candidates.extend([
         str(Path(__file__).parent / "fonts" / "NotoSansDevanagari-Regular.ttf"),
         "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/Arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ])
 
@@ -150,38 +222,52 @@ def get_font(size: int):
     return ImageFont.load_default()
 
 
-def fit_text(draw, text, box_width, box_height):
-    text = text.strip()
+def wrap_text(draw, text, font, max_width):
+    words = text.split()
+    lines = []
+    current = ""
 
-    for size in range(max(10, min(64, box_height)), 7, -1):
+    for word in words:
+        candidate = word if not current else f"{current} {word}"
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+
+        if bbox[2] - bbox[0] <= max_width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    return "\n".join(lines)
+
+
+def fit_text(draw, text, box_width, box_height, preferred_size):
+    """Start near the source font size and shrink only when required."""
+    start = max(8, min(96, int(preferred_size)))
+
+    for size in range(start, 7, -1):
         font = get_font(size)
-        words = text.split()
-        lines = []
-        current = ""
+        rendered = wrap_text(draw, text.strip(), font, box_width)
 
-        for word in words:
-            candidate = word if not current else f"{current} {word}"
-            bbox = draw.textbbox((0, 0), candidate, font=font)
-
-            if bbox[2] - bbox[0] <= box_width:
-                current = candidate
-            else:
-                if current:
-                    lines.append(current)
-                current = word
-
-        if current:
-            lines.append(current)
-
-        rendered = "\n".join(lines)
         bbox = draw.multiline_textbbox(
-            (0, 0), rendered, font=font, spacing=2
+            (0, 0),
+            rendered,
+            font=font,
+            spacing=max(1, int(size * 0.12)),
+            align="center",
         )
 
-        if bbox[2] - bbox[0] <= box_width and bbox[3] - bbox[1] <= box_height:
-            return font, rendered
+        if (
+            bbox[2] - bbox[0] <= box_width
+            and bbox[3] - bbox[1] <= box_height
+        ):
+            return font, rendered, max(1, int(size * 0.12))
 
-    return get_font(8), text
+    font = get_font(8)
+    return font, text.strip(), 1
 
 
 def remove_text_background(image_bytes, regions):
@@ -198,15 +284,16 @@ def remove_text_background(image_bytes, regions):
     mask = np.zeros(image.shape[:2], dtype=np.uint8)
 
     for region in regions:
-        x1, y1, x2, y2 = region["bbox"]
-        pad = max(2, int((y2 - y1) * 0.12))
+        for box in region.get("mask_boxes", [region["bbox"]]):
+            x1, y1, x2, y2 = box
+            pad = max(2, int((y2 - y1) * 0.18))
 
-        x1 = max(0, x1 - pad)
-        y1 = max(0, y1 - pad)
-        x2 = min(image.shape[1], x2 + pad)
-        y2 = min(image.shape[0], y2 + pad)
+            x1 = max(0, x1 - pad)
+            y1 = max(0, y1 - pad)
+            x2 = min(image.shape[1], x2 + pad)
+            y2 = min(image.shape[0], y2 + pad)
 
-        cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
 
     if np.any(mask):
         image = cv2.inpaint(image, mask, 3, cv2.INPAINT_TELEA)
@@ -215,38 +302,63 @@ def remove_text_background(image_bytes, regions):
 
 
 def render_translations(image_bytes, regions):
-    image = remove_text_background(image_bytes, regions)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    original_png = normalize_image(image_bytes)
+    original_rgb = cv2.cvtColor(
+        cv2.imdecode(
+            np.frombuffer(original_png, dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        ),
+        cv2.COLOR_BGR2RGB,
+    )
 
-    pil_image = Image.fromarray(image)
+    cleaned = remove_text_background(image_bytes, regions)
+    cleaned_rgb = cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB)
+
+    pil_image = Image.fromarray(cleaned_rgb)
     draw = ImageDraw.Draw(pil_image)
 
     for region in regions:
         x1, y1, x2, y2 = region["bbox"]
         translated = region["translated_text"]
 
-        padding = 3
+        source_height = max(8, y2 - y1)
+        # Approximate the source font size from the original OCR line height.
+        preferred_size = max(10, int(source_height * 0.82))
+
+        padding = max(2, int(source_height * 0.08))
         box_width = max(10, x2 - x1 - padding * 2)
         box_height = max(10, y2 - y1 - padding * 2)
 
-        font, text = fit_text(draw, translated, box_width, box_height)
-
-        bbox = draw.multiline_textbbox(
-            (0, 0), text, font=font, spacing=2, align="center"
+        font, text, spacing = fit_text(
+            draw,
+            translated,
+            box_width,
+            box_height,
+            preferred_size,
         )
 
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
+        text_bbox = draw.multiline_textbbox(
+            (0, 0),
+            text,
+            font=font,
+            spacing=spacing,
+            align="center",
+        )
+
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
 
         tx = x1 + max(1, ((x2 - x1) - text_width) // 2)
         ty = y1 + max(1, ((y2 - y1) - text_height) // 2)
+
+        text_color = estimate_text_color(original_rgb, region["bbox"])
 
         draw.multiline_text(
             (tx, ty),
             text,
             font=font,
-            fill="black",
-            spacing=2,
+            fill=text_color,
+            spacing=spacing,
             align="center",
         )
 
@@ -263,6 +375,7 @@ async def health():
         "provider": "aws-bedrock",
         "ocr": "aws-textract",
         "model": BEDROCK_MODEL_ID,
+        "style_matching": "auto",
     }
 
 
