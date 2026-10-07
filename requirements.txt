@@ -1,7 +1,6 @@
 fastapi
 uvicorn[standard]
 python-multipart
-openai
+boto3
 python-dotenv
 Pillow
-requests
