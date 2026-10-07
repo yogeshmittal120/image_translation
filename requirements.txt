@@ -4,3 +4,5 @@ python-multipart
 boto3
 python-dotenv
 Pillow
+opencv-python-headless
+numpy
