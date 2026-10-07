@@ -1,8 +1,10 @@
 # Image Translation API
 
-FastAPI service that accepts an image, detects visible text regions, translates them into a requested language, renders the translations back into the original locations, and returns the translated PNG image.
+FastAPI service using **AWS Bedrock Claude Sonnet** to detect text in an image, translate it into a requested language, render the translation into the detected regions, and return the translated PNG image.
 
 ## Setup
+
+Configure AWS credentials using the normal AWS credential chain (environment variables, AWS profile, IAM role, etc.).
 
 ```bash
 python -m venv .venv
@@ -14,7 +16,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and set `OPENAI_API_KEY`.
+Copy `.env.example` to `.env` and configure your Bedrock region and model ID.
 
 ```bash
 uvicorn app.main:app --reload
@@ -22,12 +24,21 @@ uvicorn app.main:app --reload
 
 Swagger: http://127.0.0.1:8000/docs
 
+## AWS Bedrock
+
+The application uses the Bedrock Runtime `converse` API with an image content block and a text prompt.
+
+Required AWS permission:
+- `bedrock:InvokeModel` for the selected Claude Sonnet model.
+
+Make sure the selected Claude Sonnet model is enabled/available in your AWS Bedrock account and region.
+
 ## API
 
 ### POST /translate-image
 
 Multipart form fields:
-- `image`: JPEG, PNG, or WEBP
+- `image`: JPEG, PNG, WEBP, or GIF
 - `target_language`: e.g. Hindi, French, Spanish
 
 The API returns a PNG image with translated text drawn into the detected text regions.
@@ -44,20 +55,18 @@ curl -X POST "http://127.0.0.1:8000/translate-image" ^
 ## How it works
 
 1. FastAPI receives the image.
-2. The vision model detects readable text and its pixel bounding boxes.
-3. The model translates each text region.
-4. Pillow covers the original region and renders the translated text.
-5. The generated PNG is returned as the API response.
-
-## Notes
-
-The current renderer uses a white rectangle over each detected text region. This works well for documents, screenshots, signs, and simple backgrounds. For complex photographs/backgrounds, the next improvement should be background-aware inpainting plus font/style matching.
-
-For languages that require special fonts, set `FONT_PATH` in `.env` to a compatible TTF font.
+2. Claude Sonnet analyzes the image and identifies readable text regions.
+3. Claude returns source text, translated text, and pixel bounding boxes.
+4. Pillow covers the original text region and renders the translation.
+5. The generated PNG is returned to the client.
 
 ## Environment
 
-- `OPENAI_API_KEY`: required
-- `OPENAI_MODEL`: vision-capable model to use
-- `MAX_IMAGE_SIZE_MB`: maximum upload size, default 10 MB
-- `FONT_PATH`: optional TTF font path
+- `AWS_REGION`: Bedrock region, e.g. `us-east-1`
+- `BEDROCK_MODEL_ID`: your Claude Sonnet model ID
+- `MAX_IMAGE_SIZE_MB`: maximum upload size, default 3 MB
+- `FONT_PATH`: optional TTF font path for translated text
+
+## Production note
+
+The current renderer uses a white rectangle over each detected text region. This works well for documents and simple backgrounds. For photographs or complex backgrounds, the next step should be background-aware inpainting and font/style matching.
